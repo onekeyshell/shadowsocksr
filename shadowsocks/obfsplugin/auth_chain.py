@@ -18,8 +18,6 @@
 from __future__ import absolute_import, division, print_function, \
     with_statement
 
-import os
-import sys
 import hashlib
 import logging
 import binascii
@@ -29,16 +27,16 @@ import datetime
 import random
 import math
 import struct
-import zlib
 import hmac
-import hashlib
 import bisect
 
 import shadowsocks
 from shadowsocks import common, lru_cache, encrypt
 from shadowsocks.obfsplugin import plain
 from shadowsocks.common import to_bytes, to_str, ord, chr
+from shadowsocks.crypto import openssl
 
+rand_bytes = openssl.rand_bytes
 
 def create_auth_chain_a(method):
     return auth_chain_a(method)
@@ -87,24 +85,24 @@ class xorshift128plus(object):
         y = self.v1
         self.v0 = y
         x ^= ((x & xorshift128plus.mov_mask) << 23)
-        x ^= (y ^ (x >> 17) ^ (y >> 26)) & xorshift128plus.max_int
+        x ^= (y ^ (x >> 17) ^ (y >> 26))
         self.v1 = x
         return (x + y) & xorshift128plus.max_int
 
     def init_from_bin(self, bin):
-        bin += b'\0' * 16
+        if len(bin) < 16:
+            bin += b'\0' * 16
         self.v0 = struct.unpack('<Q', bin[:8])[0]
         self.v1 = struct.unpack('<Q', bin[8:16])[0]
 
     def init_from_bin_len(self, bin, length):
-        bin += b'\0' * 16
-        bin = struct.pack('<H', length) + bin[2:]
-        self.v0 = struct.unpack('<Q', bin[:8])[0]
+        if len(bin) < 16:
+            bin += b'\0' * 16
+        self.v0 = struct.unpack('<Q', struct.pack('<H', length) + bin[2:8])[0]
         self.v1 = struct.unpack('<Q', bin[8:16])[0]
 
         for i in range(4):
             self.next()
-
 
 def match_begin(str1, str2):
     if len(str1) >= len(str2):
@@ -335,7 +333,7 @@ class auth_chain_a(auth_base):
     def rnd_data(self, buf_size, buf, last_hash, random):
         rand_len = self.rnd_data_len(buf_size, last_hash, random)
 
-        rnd_data_buf = os.urandom(rand_len)
+        rnd_data_buf = rand_bytes(rand_len)
 
         if buf_size == 0:
             return rnd_data_buf
@@ -349,7 +347,6 @@ class auth_chain_a(auth_base):
     def pack_client_data(self, buf):
         buf = self.encryptor.encrypt(buf)
         data = self.rnd_data(len(buf), buf, self.last_client_hash, self.random_client)
-        data_len = len(data) + 8
         mac_key = self.user_key + struct.pack('<I', self.pack_id)
         length = len(buf) ^ struct.unpack('<H', self.last_client_hash[14:])[0]
         data = struct.pack('<H', length) + data
@@ -361,7 +358,6 @@ class auth_chain_a(auth_base):
     def pack_server_data(self, buf):
         buf = self.encryptor.encrypt(buf)
         data = self.rnd_data(len(buf), buf, self.last_server_hash, self.random_server)
-        data_len = len(data) + 8
         mac_key = self.user_key + struct.pack('<I', self.pack_id)
         length = len(buf) ^ struct.unpack('<H', self.last_server_hash[14:])[0]
         data = struct.pack('<H', length) + data
@@ -372,11 +368,10 @@ class auth_chain_a(auth_base):
 
     def pack_auth_data(self, auth_data, buf):
         data = auth_data
-        data_len = 12 + 4 + 16 + 4
         data = data + (struct.pack('<H', self.server_info.overhead) + struct.pack('<H', 0))
         mac_key = self.server_info.iv + self.server_info.key
 
-        check_head = os.urandom(4)
+        check_head = rand_bytes(4)
         self.last_client_hash = hmac.new(mac_key, check_head, self.hashfunc).digest()
         check_head += self.last_client_hash[:8]
 
@@ -386,9 +381,9 @@ class auth_chain_a(auth_base):
                 self.user_key = items[1]
                 uid = struct.pack('<I', int(items[0]))
             except:
-                uid = os.urandom(4)
+                uid = rand_bytes(4)
         else:
-            uid = os.urandom(4)
+            uid = rand_bytes(4)
         if self.user_key is None:
             self.user_key = self.server_info.key
 
@@ -409,13 +404,16 @@ class auth_chain_a(auth_base):
         if self.server_info.data.connection_id > 0xFF000000:
             self.server_info.data.local_client_id = b''
         if not self.server_info.data.local_client_id:
-            self.server_info.data.local_client_id = os.urandom(4)
+            self.server_info.data.local_client_id = rand_bytes(4)
             logging.debug("local_client_id %s" % (binascii.hexlify(self.server_info.data.local_client_id),))
-            self.server_info.data.connection_id = struct.unpack('<I', os.urandom(4))[0] & 0xFFFFFF
+            self.server_info.data.connection_id = struct.unpack('<I', rand_bytes(4))[0] & 0xFFFFFF
         self.server_info.data.connection_id += 1
         return b''.join([struct.pack('<I', utc_time),
                          self.server_info.data.local_client_id,
                          struct.pack('<I', self.server_info.data.connection_id)])
+
+    def on_recv_auth_data(self, utc_time):
+        pass
 
     def client_pre_encrypt(self, buf):
         ret = b''
@@ -551,6 +549,7 @@ class auth_chain_a(auth_base):
                 logging.info('%s: auth fail, data %s' % (self.no_compatible_method, binascii.hexlify(out_buf)))
                 return self.not_match_return(self.recv_buf)
 
+            self.on_recv_auth_data(utc_time)
             self.encryptor = encrypt.Encryptor(
                 to_bytes(base64.b64encode(self.user_key)) + to_bytes(base64.b64encode(self.last_client_hash)), 'rc4')
             self.recv_buf = self.recv_buf[36:]
@@ -565,7 +564,7 @@ class auth_chain_a(auth_base):
             if length >= 4096:
                 self.raw_trans = True
                 self.recv_buf = b''
-                if self.recv_id == 0:
+                if self.recv_id == 1:
                     logging.info(self.no_compatible_method + ': over size')
                     return (b'E' * 2048, False)
                 else:
@@ -581,7 +580,7 @@ class auth_chain_a(auth_base):
                 ))
                 self.raw_trans = True
                 self.recv_buf = b''
-                if self.recv_id == 0:
+                if self.recv_id == 1:
                     return (b'E' * 2048, False)
                 else:
                     raise Exception('server_post_decrype data uncorrect checksum')
@@ -610,9 +609,9 @@ class auth_chain_a(auth_base):
                 except:
                     pass
             if self.user_key is None:
-                self.user_id = os.urandom(4)
+                self.user_id = rand_bytes(4)
                 self.user_key = self.server_info.key
-        authdata = os.urandom(3)
+        authdata = rand_bytes(3)
         mac_key = self.server_info.key
         md5data = hmac.new(mac_key, authdata, self.hashfunc).digest()
         uid = struct.unpack('<I', self.user_id)[0] ^ struct.unpack('<I', md5data[:4])[0]
@@ -621,7 +620,7 @@ class auth_chain_a(auth_base):
         encryptor = encrypt.Encryptor(
             to_bytes(base64.b64encode(self.user_key)) + to_bytes(base64.b64encode(md5data)), 'rc4')
         out_buf = encryptor.encrypt(buf)
-        buf = out_buf + os.urandom(rand_len) + authdata + uid
+        buf = out_buf + rand_bytes(rand_len) + authdata + uid
         return buf + hmac.new(self.user_key, buf, self.hashfunc).digest()[:1]
 
     def client_udp_post_decrypt(self, buf):
@@ -645,13 +644,13 @@ class auth_chain_a(auth_base):
                 user_key = self.server_info.key
             else:
                 user_key = self.server_info.recv_iv
-        authdata = os.urandom(7)
+        authdata = rand_bytes(7)
         mac_key = self.server_info.key
         md5data = hmac.new(mac_key, authdata, self.hashfunc).digest()
         rand_len = self.udp_rnd_data_len(md5data, self.random_server)
         encryptor = encrypt.Encryptor(to_bytes(base64.b64encode(user_key)) + to_bytes(base64.b64encode(md5data)), 'rc4')
         out_buf = encryptor.encrypt(buf)
-        buf = out_buf + os.urandom(rand_len) + authdata
+        buf = out_buf + rand_bytes(rand_len) + authdata
         return buf + hmac.new(user_key, buf, self.hashfunc).digest()[:1]
 
     def server_udp_post_decrypt(self, buf):
@@ -855,6 +854,7 @@ class auth_chain_e(auth_chain_d):
         self.no_compatible_method = 'auth_chain_e'
 
     def rnd_data_len(self, buf_size, last_hash, random):
+        random.init_from_bin_len(last_hash, buf_size)
         other_data_size = buf_size + self.server_info.overhead
         # if other_data_size > the bigest item in data_size_list0, not padding any data
         if other_data_size >= self.data_size_list0[-1]:
@@ -879,15 +879,17 @@ class auth_chain_f(auth_chain_e):
             max_client = int(server_info.protocol_param.split('#')[0])
         except:
             max_client = 64
+        self.server_info.data.set_max_client(max_client)
         try:
             self.key_change_interval = int(server_info.protocol_param.split('#')[1])  # config are in second
         except:
             self.key_change_interval = 60 * 60 * 24  # a day by second
-        self.key_change_datetime_key = int(int(time.time()) / self.key_change_interval)
+
+    def on_recv_auth_data(self, utc_time):
+        self.key_change_datetime_key = int(utc_time / self.key_change_interval)
         self.key_change_datetime_key_bytes = []  # big bit first list
         for i in range(7, -1, -1):  # big-ending compare to c
             self.key_change_datetime_key_bytes.append((self.key_change_datetime_key >> (8 * i)) & 0xFF)
-        self.server_info.data.set_max_client(max_client)
         self.init_data_size(self.server_info.key)
 
     def init_data_size(self, key):
@@ -896,9 +898,13 @@ class auth_chain_f(auth_chain_e):
         random = xorshift128plus()
         # key xor with key_change_datetime_key
         new_key = bytearray(key)
+        new_key_str = ''
         for i in range(0, 8):
             new_key[i] ^= self.key_change_datetime_key_bytes[i]
-        random.init_from_bin(new_key)
+            new_key_str += chr(new_key[i])
+        for i in range(8, len(new_key)):
+            new_key_str += chr(new_key[i])
+        random.init_from_bin(to_bytes(new_key_str))
         # 补全数组长为12~24-1
         list_len = random.next() % (8 + 16) + (4 + 8)
         for i in range(0, list_len):
